@@ -991,6 +991,197 @@ class PI0Pytorch(nn.Module):
             x_t = x_t + dt * v_t
         return x_t
 
+    def _build_attention_capture_config(self) -> HeadSupervisionConfig:
+        """Build the inference-only configuration used to export attention maps.
+
+        Attention probabilities are normally materialized only for auxiliary
+        supervision during training.  For visualization we explicitly request
+        all action-expert query heads in the four guided layers.  This method is
+        used only by the eager attention-capture path, so the normal compiled
+        inference path remains unchanged.
+        """
+        num_heads = int(self.paligemma_with_expert.gemma_expert.model.config.num_attention_heads)
+        return HeadSupervisionConfig(
+            supervised_layers=tuple(self.guided_layer_indices),
+            num_export_heads=0,
+            num_probs_export_heads=num_heads,
+            include_skill_states=False,
+            include_origin_states=self.control_attention_enabled,
+        )
+
+    @staticmethod
+    def _compact_attention_maps(
+        attention_probs: Tensor,
+        *,
+        action_query_start_index: int,
+        view_patch_counts: list[int],
+        head_indices: list[int] | tuple[int, ...] | None = None,
+    ) -> Tensor:
+        """Return image-only attention averaged over action queries.
+
+        Output shape is ``[heads, views, patches]`` for a single-item batch.
+        Keeping heads and views makes the saved file useful for both the
+        paper-style object-head visualization and all-head baselines, while
+        avoiding the much larger full ``[heads, queries, keys]`` tensor.
+        """
+        if attention_probs.ndim != 4 or attention_probs.shape[0] != 1:
+            raise ValueError(
+                "Attention capture currently expects batch size 1, got "
+                f"{tuple(attention_probs.shape)}."
+            )
+        if action_query_start_index >= attention_probs.shape[2]:
+            raise ValueError(
+                "Attention query slice is empty: "
+                f"start={action_query_start_index}, query_length={attention_probs.shape[2]}. "
+                "The query axis contains suffix/action queries only; do not use the prefix length as an offset."
+            )
+        if head_indices is not None:
+            attention_probs = attention_probs[:, list(head_indices)]
+
+        num_image_keys = sum(view_patch_counts)
+        image_probs = attention_probs[:, :, action_query_start_index:, :num_image_keys]
+        image_probs = image_probs.mean(dim=2)[0]  # [heads, image_keys]
+
+        views = []
+        offset = 0
+        for patch_count in view_patch_counts:
+            views.append(image_probs[:, offset : offset + patch_count])
+            offset += patch_count
+        return torch.stack(views, dim=1).detach().to(device="cpu", dtype=torch.float16)
+
+    def _extract_attention_snapshot(
+        self,
+        all_supervised_states: list[tuple[int, SupervisedHeadStates]],
+        *,
+        action_query_start_index: int,
+        view_patch_counts: list[int],
+        timestep: float,
+    ) -> dict:
+        """Convert per-layer attention states into a compact serializable snapshot."""
+        origin_maps: dict[str, Tensor] = {}
+        object_maps: dict[str, Tensor] = {}
+
+        for layer_index, states in all_supervised_states:
+            origin_probs = states.origin_attention_probs
+            if origin_probs is None:
+                origin_probs = states.attention_probs
+            if origin_probs is not None:
+                origin_maps[str(layer_index)] = self._compact_attention_maps(
+                    origin_probs,
+                    action_query_start_index=action_query_start_index,
+                    view_patch_counts=view_patch_counts,
+                )
+
+            # pi0_libero_object uses the control/object branch.  The full
+            # object+depth+skill config uses origin attention for object loss;
+            # mirror that configuration here so the saved "object" map is the
+            # same branch that receives object supervision.
+            if self.config.use_object_loss and states.attention_probs is not None:
+                object_probs = states.attention_probs if self.object_use_control else origin_probs
+                if object_probs is not None:
+                    object_maps[str(layer_index)] = self._compact_attention_maps(
+                        object_probs,
+                        action_query_start_index=action_query_start_index,
+                        view_patch_counts=view_patch_counts,
+                        head_indices=self.object_head_indices,
+                    )
+
+        snapshot = {
+            "timestep": float(timestep),
+            "layer_indices": [int(layer_index) for layer_index, _ in all_supervised_states],
+            "view_patch_counts": [int(count) for count in view_patch_counts],
+            "origin": origin_maps,
+        }
+        if object_maps:
+            snapshot["object"] = object_maps
+        return snapshot
+
+    @torch.no_grad()
+    def sample_actions_with_attention(
+        self,
+        device,
+        observation,
+        noise=None,
+        num_steps=10,
+        attention_interval=1,
+    ) -> tuple[Tensor, dict]:
+        """Run eager inference and return actions plus compact attention snapshots.
+
+        ``attention_interval`` is measured in denoising steps.  For example,
+        with ``num_steps=10`` and ``attention_interval=2``, maps are saved at
+        denoising loop steps 0, 2, 4, 6, and 8.  This method intentionally
+        bypasses the compiled action-only function because attention capture
+        materializes per-layer probability tensors.
+        """
+        attention_interval = int(attention_interval)
+        if attention_interval <= 0:
+            raise ValueError(f"attention_interval must be positive, got {attention_interval}")
+
+        bsize = observation.state.shape[0]
+        if bsize != 1:
+            raise ValueError("Attention export currently supports batch size 1 only.")
+        if noise is None:
+            actions_shape = (bsize, self.config.action_horizon, self.config.action_dim)
+            noise = self.sample_noise(actions_shape, device)
+
+        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=False)
+        # ``images`` are still BCHW tensors here, so ``image.shape[1]`` is
+        # the RGB channel count (3), not the number of SigLIP image tokens.
+        # Attention keys are laid out as 256 patches per view.  Use the same
+        # registered layout that is used by the object-head supervision code.
+        num_patches_per_view = int(self.view_patch_indices.shape[1])
+        view_patch_counts = [num_patches_per_view for _ in images]
+        depth_kv = self.compute_depth_key_values(images)
+
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
+        (prefix_embs,) = self._align_prefix_embeddings_dtype(prefix_embs)
+
+        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks, dtype=prefix_embs.dtype)
+
+        _, past_key_values, _ = self.paligemma_with_expert(
+            attention_mask=prefix_att_2d_masks_4d,
+            position_ids=prefix_position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, None],
+            use_cache=True,
+        )
+
+        dt = -1.0 / num_steps
+        x_t = noise
+        snapshots = []
+        capture_config = self._build_attention_capture_config()
+        for step in range(num_steps):
+            t = 1.0 + step * dt
+            expanded_time = torch.full((bsize,), t, dtype=torch.float32, device=device)
+            step_result = self.denoise_step(
+                state,
+                prefix_pad_masks,
+                past_key_values,
+                x_t,
+                expanded_time,
+                depth_kv=depth_kv,
+                attention_capture_config=capture_config if step % attention_interval == 0 else None,
+                view_patch_counts=view_patch_counts,
+            )
+            if isinstance(step_result, tuple):
+                v_t, snapshot = step_result
+            else:
+                v_t, snapshot = step_result, None
+            if snapshot is not None:
+                snapshots.append(snapshot)
+            x_t = x_t + dt * v_t
+
+        return x_t, {
+            "format_version": 1,
+            "model_type": "pi05" if self.pi05 else "pi0",
+            "layer_indices": list(self.guided_layer_indices),
+            "view_names": ["base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb"],
+            "num_patches_per_view": 256,
+            "snapshots": snapshots,
+        }
+
     def denoise_step(
         self,
         state,
@@ -999,6 +1190,8 @@ class PI0Pytorch(nn.Module):
         x_t,
         timestep,
         depth_kv=None,
+        attention_capture_config: HeadSupervisionConfig | None = None,
+        view_patch_counts: list[int] | None = None,
     ):
         """Apply one denoising step of the noise `x_t` at a given timestep."""
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, timestep)
@@ -1021,10 +1214,10 @@ class PI0Pytorch(nn.Module):
 
         # Prepare attention masks
         # Denoising uses expert-side queries, which run in float32 by design.
-        full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks, dtype=torch.float32)
+        full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks, dtype=suffix_embs.dtype)
 
         # Call paligemma_with_expert - always returns 3 values: outputs_embeds, past_key_values, all_supervised_states
-        outputs_embeds, _, _ = self.paligemma_with_expert(
+        outputs_embeds, _, all_supervised_states = self.paligemma_with_expert(
             attention_mask=full_att_2d_masks_4d,
             position_ids=position_ids,
             past_key_values=past_key_values,
@@ -1033,13 +1226,31 @@ class PI0Pytorch(nn.Module):
             adarms_cond=[None, adarms_cond],
             guided_layer_indices=self.guided_layer_indices,
             depth_kv=depth_kv,
+            head_supervision_config=attention_capture_config,
         )
 
         suffix_out = outputs_embeds[1]
         suffix_out = suffix_out[:, -self.config.action_horizon :]
         suffix_out = suffix_out.to(dtype=torch.float32)
 
-        return self.action_out_proj(suffix_out)
+        action_output = self.action_out_proj(suffix_out)
+        if attention_capture_config is None:
+            return action_output
+
+        if view_patch_counts is None:
+            raise ValueError("view_patch_counts is required when attention capture is enabled")
+        # ``all_supervised_states[*].attention_probs`` has query axis
+        # [state, action...] for pi0 or [action...] for pi05.  It does not
+        # include the prefix image/language queries, so prefix_pad_masks.shape[1]
+        # must not be used as an offset here.
+        action_query_start_idx = 1 if not self.pi05 else 0
+        snapshot = self._extract_attention_snapshot(
+            all_supervised_states,
+            action_query_start_index=action_query_start_idx,
+            view_patch_counts=view_patch_counts,
+            timestep=float(timestep[0].item()),
+        )
+        return action_output, snapshot
 
     @torch.no_grad()
     def compute_skill_logits_for_infer(

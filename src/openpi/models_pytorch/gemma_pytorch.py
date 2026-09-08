@@ -734,8 +734,10 @@ class PaliGemmaWithExpertModel(nn.Module):
             # Use per-layer path when ControlNet is active or when depth attention is needed.
             expert_layer = self.gemma_expert.model.layers[0]
             expert_uses_control_attn = isinstance(expert_layer.self_attn, ControlAwareAttention)
-            if expert_uses_control_attn or depth_kv is not None:
+            if expert_uses_control_attn or depth_kv is not None or head_supervision_config is not None:
                 # Continue to layer-by-layer processing below with [None, suffix] inputs.
+                # Attention visualization also needs this path for raw pi0,
+                # whose action expert has no ControlAwareAttention wrapper.
                 inputs_embeds = [None, inputs_embeds[1]]
             else:
                 # No ControlNet or depth attention: can directly call gemma_expert.model.

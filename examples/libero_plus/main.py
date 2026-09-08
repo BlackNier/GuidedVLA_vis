@@ -21,6 +21,7 @@ import tqdm
 import tyro
 
 LIBERO_DUMMY_ACTION = [0.0] * 6 + [-1.0]
+ATTENTION_CAPTURE_IMPL = "fp32_masked_softmax_v2"
 LIBERO_ENV_RESOLUTION = 256  # resolution used to render training data
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 DEFAULT_TASK_CLASSIFICATION_PATH = (
@@ -59,8 +60,16 @@ class Args:
     task_ids: Optional[str] = None
     num_steps_wait: int = 10
     num_trials_per_task: int = 1
+    # Global cap on newly executed rollouts across all selected tasks/suites.
+    # Existing completed rollouts are skipped and do not consume this budget.
+    num_rollouts: Optional[int] = None
 
     video_out_path: str = "data/libero/videos"
+    image_out_path: str = "data/libero_plus/rollout_images"
+    attention_out_path: str = "data/libero_plus/rollout_attention"
+    # Save one image/PT pair every N exported rollout frames.  This is the
+    # client-side counterpart of the server-side attention dump interval.
+    attention_dump_interval: int = 1
 
     seed: int = 7
 
@@ -216,10 +225,23 @@ class ArtifactPaths:
             prefix=prefix,
         )
 
+    @classmethod
+    def build_rollout_dir(
+        cls,
+        base_dir: str,
+        task_description: str,
+        episode_index: int,
+        suffix: str,
+    ) -> pathlib.Path:
+        filename = cls.safe_video_filename(task_description, episode_index, suffix, prefix="rollout_")
+        return pathlib.Path(base_dir) / pathlib.Path(filename).stem
+
 
 @dataclasses.dataclass(frozen=True)
 class EpisodeArtifacts:
     rollout_video: pathlib.Path
+    image_dir: pathlib.Path
+    attention_dir: pathlib.Path
 
     @classmethod
     def from_args(cls, args: Args, task_description: str, episode_index: int, suffix: str) -> "EpisodeArtifacts":
@@ -231,6 +253,19 @@ class EpisodeArtifacts:
                 suffix,
                 prefix="rollout_",
             ),
+            image_dir=ArtifactPaths.build_rollout_dir(
+                args.image_out_path,
+                task_description,
+                episode_index,
+                suffix,
+            ),
+            attention_dir=ArtifactPaths.build_rollout_dir(
+                args.attention_out_path,
+                task_description,
+                episode_index,
+                suffix,
+            )
+            / "attention",
         )
 
     @classmethod
@@ -253,6 +288,106 @@ class EpisodeArtifacts:
     def write_rollout(self, frames, *, fps: int) -> pathlib.Path:
         return self._write_video(self.rollout_video, frames, fps=fps)
 
+    def write_images(self, agentview_frames, wristview_frames, frame_indices: List[int]) -> pathlib.Path:
+        """Write the two LIBERO camera streams as per-step PNG images."""
+        for view_name in ("agentview", "wristview"):
+            view_dir = self.image_dir / view_name
+            if view_dir.exists():
+                for old_image_file in view_dir.glob("*.png"):
+                    old_image_file.unlink()
+        for view_name, frames in (("agentview", agentview_frames), ("wristview", wristview_frames)):
+            view_dir = self.image_dir / view_name
+            view_dir.mkdir(parents=True, exist_ok=True)
+            for frame_index in frame_indices:
+                frame = frames[frame_index]
+                imageio.imwrite(view_dir / f"{frame_index:06d}.png", np.asarray(frame))
+        return self.image_dir
+
+    @staticmethod
+    def _tensorize_attention(value):
+        import torch
+
+        if isinstance(value, np.ndarray):
+            return torch.from_numpy(np.ascontiguousarray(value))
+        if isinstance(value, dict):
+            return {key: EpisodeArtifacts._tensorize_attention(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [EpisodeArtifacts._tensorize_attention(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(EpisodeArtifacts._tensorize_attention(item) for item in value)
+        return value
+
+    def write_attention(
+        self,
+        attention_per_frame,
+        *,
+        frame_indices: List[int],
+        task_description: str,
+        episode_index: int,
+    ) -> pathlib.Path:
+        """Write one torch-loadable attention file for every saved image frame.
+
+        The file name is the image frame index, so for example
+        ``attention/000012.pt`` corresponds to ``agentview/000012.png`` and
+        ``wristview/000012.png``.  With ``replan_steps > 1`` the same model
+        attention is intentionally reused for the action chunk; the payload
+        records the original policy-inference frame in ``source_env_step``.
+        """
+        import torch
+
+        self.attention_dir.mkdir(parents=True, exist_ok=True)
+        for old_attention_file in self.attention_dir.glob("*.pt"):
+            old_attention_file.unlink()
+        for frame_index in frame_indices:
+            item = attention_per_frame[frame_index]
+            payload = {
+                "format_version": 2,
+                "task_description": str(task_description),
+                "episode_index": int(episode_index),
+                "frame_index": int(frame_index),
+                "env_step": None if item is None else int(item["env_step"]),
+                "source_env_step": None if item is None else int(item["source_env_step"]),
+                "attention_reused": False if item is None else bool(item["attention_reused"]),
+                "attention": None if item is None else self._tensorize_attention(item["attention"]),
+            }
+            if os.environ.get("OPENPI_ATTENTION_DEBUG", "0") == "1" and payload["attention"] is not None:
+                snapshots = payload["attention"].get("snapshots", [])
+                if snapshots:
+                    origin = snapshots[0].get("origin", {})
+                    for layer in ("9", "10", "11", "12"):
+                        if layer in origin:
+                            value = origin[layer]
+                            print(
+                                "client attention before torch.save:",
+                                frame_index,
+                                layer,
+                                "finite=",
+                                torch.isfinite(value).all().item(),
+                                "shape=",
+                                tuple(value.shape),
+                                "dtype=",
+                                value.dtype,
+                                flush=True,
+                            )
+            torch.save(payload, self.attention_dir / f"{frame_index:06d}.pt")
+        return self.attention_dir
+
+    @classmethod
+    def _attention_capture_is_current(cls, attention_dir: pathlib.Path) -> bool:
+        """Reject stale attention files produced before the numerical fixes."""
+        attention_files = sorted(attention_dir.glob("*.pt"), key=lambda path: path.name)
+        if not attention_files:
+            return False
+        import torch
+
+        try:
+            payload = torch.load(attention_files[0], map_location="cpu", weights_only=False)
+        except TypeError as exc:
+            if "weights_only" not in str(exc):
+                return False
+            payload = torch.load(attention_files[0], map_location="cpu")
+        return payload.get("attention", {}).get("capture_impl") == ATTENTION_CAPTURE_IMPL
+
     @classmethod
     def find_existing(
         cls,
@@ -262,7 +397,18 @@ class EpisodeArtifacts:
     ) -> Optional["ExistingEpisodeResult"]:
         for success in (True, False):
             artifacts = cls.from_result(args, task_description, episode_index, success=success)
-            if artifacts.rollout_video.exists():
+            agentview_dir = artifacts.image_dir / "agentview"
+            wristview_dir = artifacts.image_dir / "wristview"
+            agentview_frames = {path.stem for path in agentview_dir.glob("*.png")}
+            wristview_frames = {path.stem for path in wristview_dir.glob("*.png")}
+            attention_frames = {path.stem for path in artifacts.attention_dir.glob("*.pt")}
+            image_complete = bool(agentview_frames) and agentview_frames == wristview_frames
+            attention_complete = (
+                image_complete
+                and agentview_frames == attention_frames
+                and cls._attention_capture_is_current(artifacts.attention_dir)
+            )
+            if artifacts.rollout_video.exists() and attention_complete:
                 return ExistingEpisodeResult(success=success, video_path=artifacts.rollout_video)
         return None
 
@@ -344,12 +490,49 @@ def _episode_extra(
 @dataclasses.dataclass
 class EpisodeFrameCollector:
     replay_images: List[np.ndarray] = dataclasses.field(default_factory=list)
+    wrist_images: List[np.ndarray] = dataclasses.field(default_factory=list)
+    attention_per_frame: List[Optional[Dict[str, Any]]] = dataclasses.field(default_factory=list)
 
-    def append_step(self, img: np.ndarray) -> None:
+    def append_step(
+        self,
+        img: np.ndarray,
+        wrist_img: np.ndarray,
+        *,
+        attention: Optional[Dict[str, Any]],
+        env_step: int,
+        source_env_step: int,
+    ) -> None:
         self.replay_images.append(img)
+        self.wrist_images.append(wrist_img)
+        self.attention_per_frame.append(
+            None
+            if attention is None
+            else {
+                "env_step": int(env_step),
+                "source_env_step": int(source_env_step),
+                "attention_reused": int(env_step) != int(source_env_step),
+                "attention": attention,
+            }
+        )
 
-    def write_artifacts(self, artifacts: EpisodeArtifacts) -> pathlib.Path:
-        return artifacts.write_rollout(self.replay_images, fps=10)
+    def write_artifacts(
+        self,
+        artifacts: EpisodeArtifacts,
+        *,
+        task_description: str,
+        episode_index: int,
+        dump_interval: int,
+    ) -> pathlib.Path:
+        frame_indices = list(range(0, len(self.replay_images), dump_interval))
+        artifacts.write_rollout(self.replay_images, fps=10)
+        artifacts.write_images(self.replay_images, self.wrist_images, frame_indices)
+        artifacts.write_attention(
+            self.attention_per_frame,
+            frame_indices=frame_indices,
+            task_description=task_description,
+            episode_index=episode_index,
+        )
+        return artifacts.rollout_video
 
 
 @dataclasses.dataclass
@@ -374,6 +557,8 @@ class EpisodeRunResult:
     success: bool
     steps_taken: int
     video_path: pathlib.Path
+    image_dir: pathlib.Path
+    attention_path: pathlib.Path
     last_error: Optional[str] = None
 
 
@@ -425,6 +610,8 @@ class EpisodeRunner:
         done = False
         last_error = None
         t = 0
+        current_attention = None
+        attention_source_env_step = None
 
         while t < self.max_steps + self.args.num_steps_wait:
             try:
@@ -440,10 +627,18 @@ class EpisodeRunner:
                         logging.info(f"[DEBUG] Sending prompt to model: '{self.model_prompt}'")
 
                     response = self._infer_actions(obs, img, wrist_img)
+                    current_attention = response.get("attention")
+                    attention_source_env_step = t
                     action_plan.extend(_planned_actions(response, self.args.replan_steps))
 
                 action = action_plan.popleft()
-                frame_collector.append_step(img)
+                frame_collector.append_step(
+                    img,
+                    wrist_img,
+                    attention=current_attention,
+                    env_step=t,
+                    source_env_step=t if attention_source_env_step is None else attention_source_env_step,
+                )
                 obs, _, done, _ = self.env.step(action.tolist())
                 if done:
                     break
@@ -460,11 +655,18 @@ class EpisodeRunner:
             episode_idx,
             success=done,
         )
-        video_path = frame_collector.write_artifacts(artifacts)
+        video_path = frame_collector.write_artifacts(
+            artifacts,
+            task_description=self.task_description,
+            episode_index=episode_idx,
+            dump_interval=self.args.attention_dump_interval,
+        )
         return EpisodeRunResult(
             success=bool(done),
             steps_taken=t,
             video_path=video_path,
+            image_dir=artifacts.image_dir,
+            attention_path=artifacts.attention_dir,
             last_error=last_error,
         )
 
@@ -590,9 +792,13 @@ class ResultsStore:
                 "port": self.args.port,
                 "resize_size": self.args.resize_size,
                 "replan_steps": self.args.replan_steps,
+                "attention_dump_interval": self.args.attention_dump_interval,
                 "num_trials_per_task": self.args.num_trials_per_task,
+                "num_rollouts": self.args.num_rollouts,
                 "seed": self.args.seed,
                 "video_out_path": str(self.args.video_out_path),
+                "image_out_path": str(self.args.image_out_path),
+                "attention_out_path": str(self.args.attention_out_path),
             }
         )
 
@@ -659,7 +865,11 @@ class ResultsStore:
 
 
 def _prepare_output_dirs(args: Args) -> None:
+    if args.attention_dump_interval <= 0:
+        raise ValueError("attention_dump_interval must be positive")
     pathlib.Path(args.video_out_path).mkdir(parents=True, exist_ok=True)
+    pathlib.Path(args.image_out_path).mkdir(parents=True, exist_ok=True)
+    pathlib.Path(args.attention_out_path).mkdir(parents=True, exist_ok=True)
 
 
 def _select_task_ids_for_suite(
@@ -690,6 +900,8 @@ def _select_task_ids_for_suite(
 
 
 def eval_libero(args: Args) -> None:
+    if args.num_rollouts is not None and args.num_rollouts <= 0:
+        raise ValueError("num_rollouts must be positive when specified")
     if args.category is not None:
         args.results_json_path = _resolve_results_json_path(args)
         logging.info(f"Category-specific results will be saved to: {args.results_json_path}")
@@ -705,6 +917,7 @@ def eval_libero(args: Args) -> None:
 
     selected_map: Dict[str, List[int]] = {}
     overall_stats = RunStats()
+    executed_rollouts = 0
 
     for suite_name in suite_names:
         key = suite_name.lower()
@@ -737,6 +950,8 @@ def eval_libero(args: Args) -> None:
         suite_stats = RunStats()
 
         for task_id in tqdm.tqdm(filtered_task_ids, total=len(filtered_task_ids)):
+            if args.num_rollouts is not None and executed_rollouts >= args.num_rollouts:
+                break
             task = task_suite.get_task(task_id)
             initial_states = task_suite.get_task_init_states(task_id)
             env, task_description = _get_libero_env(task, LIBERO_ENV_RESOLUTION, args.seed)
@@ -778,8 +993,12 @@ def eval_libero(args: Args) -> None:
                         )
                         continue
 
+                    if args.num_rollouts is not None and executed_rollouts >= args.num_rollouts:
+                        break
+
                     logging.info(f"\nTask: {task_description} | episode {episode_idx + 1}/{args.num_trials_per_task}")
                     logging.info(f"Starting episode {episode_idx + 1}...")
+                    executed_rollouts += 1
                     result = episode_runner.run(episode_idx)
                     suite_stats.record(success=result.success)
                     overall_stats.record(success=result.success)
@@ -796,12 +1015,20 @@ def eval_libero(args: Args) -> None:
                         success=result.success,
                         video_path=result.video_path,
                         error=result.last_error,
-                        extra=_episode_extra(args, suite_name, max_steps, model_prompt),
+                        extra={
+                            **_episode_extra(args, suite_name, max_steps, model_prompt),
+                            "image_dir": str(result.image_dir),
+                            "attention_path": str(result.attention_path),
+                        },
                     )
             finally:
                 close_fn = getattr(env, "close", None)
                 if callable(close_fn):
                     close_fn()
+
+        if args.num_rollouts is not None and executed_rollouts >= args.num_rollouts:
+            logging.info("Reached global rollout limit: %d", args.num_rollouts)
+            break
 
         logging.info(f"[Suite {suite_name}] success rate: {suite_stats.rate}")
         logging.info(f"[Suite {suite_name}] overall success rate: {overall_stats.rate}")

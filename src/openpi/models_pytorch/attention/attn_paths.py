@@ -1,5 +1,17 @@
+import os
+
 import torch
 import torch.nn.functional as functional
+
+
+def _attention_debug_enabled() -> bool:
+    # Read this at call time so setting the variable after module import still
+    # works while debugging a long-lived server process.
+    return os.environ.get("OPENPI_ATTENTION_DEBUG", "0") == "1"
+
+
+if _attention_debug_enabled():
+    print(f"attention debug module loaded: {__file__}", flush=True)
 
 
 class UniqueHeadGather(torch.autograd.Function):
@@ -144,6 +156,17 @@ def attn_path_guided(
         distill_heads: Number of leading heads that export attention probs (0 = none).
         depth_head_indices: Tuple of head indices that attend depth tokens instead of normal KV.
     """
+    debug = _attention_debug_enabled()
+    if debug:
+        print(
+            "attention debug path entered:",
+            "query=",
+            tuple(query.shape),
+            "distill_heads=",
+            distill_heads,
+            flush=True,
+        )
+
     if (depth_token_k is None) != (depth_token_v is None):
         raise ValueError("depth_token_k and depth_token_v must either both be set or both be None")
 
@@ -191,10 +214,36 @@ def attn_path_guided(
         v_d = ugather(value_states, distill_standard)
         q_d, k_d, v_d = cast_attention_inputs(q_d, k_d, v_d)
 
-        scores = torch.matmul(q_d, k_d.transpose(-2, -1)) * scaling
+        # The eager attention-capture path must compute logits in float32.
+        # q/k can be float16 or bfloat16 during inference; doing the matmul
+        # in that dtype can overflow before softmax and produce an all-NaN
+        # attention map, even though the final softmax is requested in fp32.
+        q_d_float = torch.nan_to_num(q_d.float(), nan=0.0, posinf=0.0, neginf=0.0)
+        k_d_float = torch.nan_to_num(k_d.float(), nan=0.0, posinf=0.0, neginf=0.0)
+        scores = torch.matmul(q_d_float, k_d_float.transpose(-2, -1)) * float(scaling)
+        if debug:
+            print(
+                "attention debug:",
+                "q_d=",
+                torch.isfinite(q_d).all().item(),
+                "k_d=",
+                torch.isfinite(k_d).all().item(),
+                "scores=",
+                torch.isfinite(scores).all().item(),
+                flush=True,
+            )
+        scores = torch.nan_to_num(scores, nan=0.0, posinf=0.0, neginf=0.0)
         if attention_mask is not None:
-            scores = scores + attention_mask
+            mask = attention_mask[..., : scores.shape[-1]]
+            if mask.dtype == torch.bool:
+                scores = scores.masked_fill(~mask, torch.finfo(scores.dtype).min)
+            else:
+                scores = scores.masked_fill(mask < 0, torch.finfo(scores.dtype).min)
         probs = functional.softmax(scores, dim=-1, dtype=torch.float32)
+        if debug:
+            print("attention debug:", "probs=", torch.isfinite(probs).all().item(), flush=True)
+        probs = torch.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
+        probs = probs / probs.sum(dim=-1, keepdim=True).clamp_min(torch.finfo(probs.dtype).eps)
         if distill_contiguous:
             attention_probs = probs
         else:

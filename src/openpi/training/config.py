@@ -746,8 +746,11 @@ _CONFIGS = [
         name="pi0_libero",
         model=pi0_config.Pi0Config(),
         data=LeRobotLiberoDataConfig(
-            repo_id="physical-intelligence/libero",  # replace with your LeRobot dataset repo
-            base_config=DataConfig(prompt_from_task=True),
+            repo_id="ybwowen/libero",  # replace with your LeRobot dataset repo
+            base_config=DataConfig(
+                prompt_from_task=True,
+                local_root_dir="/home/kslab/zijian/work/GuidedVLA/data/datasets/ybwowen_libero/"
+            ),
             extra_delta_transform=True,
             repack_transforms=_transforms.Group(
                 inputs=[
@@ -764,6 +767,8 @@ _CONFIGS = [
             ),
         ),
         pytorch_training_precision="float32",
+        pytorch_weight_path="/home/kslab/zijian/work/GuidedVLA/checkpoints/pi0_base_pt",
+        batch_size=64,
         num_train_steps=30_000,
     ),
     TrainConfig(
@@ -776,7 +781,7 @@ _CONFIGS = [
             object_head_indices=[0, 1],
             object_use_control=False,
             use_depth=True,
-            depth_model_name="path/to/da3-small",
+            depth_model_name="/home/kslab/zijian/work/GuidedVLA/checkpoints/da3-small",
             depth_head_indices=[4, 5],
             depth_use_control=True,
             use_skill_loss=True,
@@ -818,12 +823,15 @@ _CONFIGS = [
             base_config=DataConfig(
                 prompt_from_task=True,
                 use_object_loss=True,
+                local_root_dir="/home/kslab/zijian/work/GuidedVLA/data/datasets/ybwowen_libero/"
             ),
             extra_delta_transform=True,
         ),
         pytorch_training_precision="float32",
         object_loss_weight=1e-3,
         num_workers=8,
+        pytorch_weight_path="/home/kslab/zijian/work/GuidedVLA/checkpoints/pi0_base_pt",
+        batch_size=64,
         num_train_steps=30_000,
     ),
     TrainConfig(

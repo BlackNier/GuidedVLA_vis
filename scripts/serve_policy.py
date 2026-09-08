@@ -44,6 +44,11 @@ class Args:
     port: int = 8000
     record: bool = False
 
+    # Optional eager attention export for LIBERO rollouts.  The client saves
+    # one attention/<frame>.pt file for each exported image frame.
+    attention_dump: bool = False
+    attention_dump_interval: int = 1
+
     max_cuda_mem_fraction: float = 0.9
     policy: Checkpoint | Default = dataclasses.field(default_factory=Default)
 
@@ -79,13 +84,32 @@ def create_default_policy(env: EnvMode, *, default_prompt: str | None = None) ->
 
 def create_policy(args: Args) -> _policy.Policy:
     """Create a policy from the given arguments."""
+    if args.attention_dump and args.attention_dump_interval <= 0:
+        raise ValueError("attention_dump_interval must be positive")
+
+    sample_kwargs = None
+    if args.attention_dump:
+        sample_kwargs = {
+            "attention_capture": True,
+            "attention_interval": args.attention_dump_interval,
+        }
+
     match args.policy:
         case Checkpoint():
             return _policy_config.create_trained_policy(
-                _config.get_config(args.policy.config), args.policy.dir, default_prompt=args.default_prompt
+                _config.get_config(args.policy.config),
+                args.policy.dir,
+                default_prompt=args.default_prompt,
+                sample_kwargs=sample_kwargs,
             )
         case Default():
-            return create_default_policy(args.env, default_prompt=args.default_prompt)
+            checkpoint = DEFAULT_CHECKPOINT[args.env]
+            return _policy_config.create_trained_policy(
+                _config.get_config(checkpoint.config),
+                checkpoint.dir,
+                default_prompt=args.default_prompt,
+                sample_kwargs=sample_kwargs,
+            )
 
 
 class PolicyServerApp:
