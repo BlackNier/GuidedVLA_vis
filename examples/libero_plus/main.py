@@ -20,6 +20,11 @@ from openpi_client import websocket_client_policy as _websocket_client_policy
 import tqdm
 import tyro
 
+try:
+    from .stage_export import StageRecorder, export_is_complete, revision
+except ImportError:
+    from stage_export import StageRecorder, export_is_complete, revision
+
 LIBERO_DUMMY_ACTION = [0.0] * 6 + [-1.0]
 ATTENTION_CAPTURE_IMPL = "fp32_masked_softmax_v2"
 LIBERO_ENV_RESOLUTION = 256  # resolution used to render training data
@@ -70,6 +75,10 @@ class Args:
     # Save one image/PT pair every N exported rollout frames.  This is the
     # client-side counterpart of the server-side attention dump interval.
     attention_dump_interval: int = 1
+
+    # Per-control-step state export is independent of PNG / attention sampling.
+    export_stage_data: bool = True
+    stage_plan_path: Optional[str] = None
 
     seed: int = 7
 
@@ -243,6 +252,14 @@ class EpisodeArtifacts:
     image_dir: pathlib.Path
     attention_dir: pathlib.Path
 
+    @property
+    def stage_dir(self) -> pathlib.Path:
+        return self.image_dir / "annotation"
+
+    @property
+    def wrist_video(self) -> pathlib.Path:
+        return self.image_dir / "wristview.mp4"
+
     @classmethod
     def from_args(cls, args: Args, task_description: str, episode_index: int, suffix: str) -> "EpisodeArtifacts":
         return cls(
@@ -386,7 +403,7 @@ class EpisodeArtifacts:
             if "weights_only" not in str(exc):
                 return False
             payload = torch.load(attention_files[0], map_location="cpu")
-        return payload.get("attention", {}).get("capture_impl") == ATTENTION_CAPTURE_IMPL
+        return (payload.get("attention") or {}).get("capture_impl") == ATTENTION_CAPTURE_IMPL
 
     @classmethod
     def find_existing(
@@ -408,7 +425,25 @@ class EpisodeArtifacts:
                 and agentview_frames == attention_frames
                 and cls._attention_capture_is_current(artifacts.attention_dir)
             )
-            if artifacts.rollout_video.exists() and attention_complete:
+            stage_complete = not args.export_stage_data or (
+                artifacts.wrist_video.exists()
+                and export_is_complete(artifacts.stage_dir, args.stage_plan_path)
+            )
+            if stage_complete and args.export_stage_data:
+                try:
+                    metadata = json.loads((artifacts.stage_dir / "metadata.json").read_text())
+                    frames = json.loads((artifacts.stage_dir / "frame_map.json").read_text())
+                    expected_frames = {f"{row['obs_id']:06d}" for row in frames if row["agentview_png"] is not None}
+                    stage_complete = (
+                        agentview_frames == expected_frames
+                        and metadata["image_interval"] == args.attention_dump_interval
+                        and metadata["replan_steps"] == args.replan_steps
+                        and metadata["num_steps_wait"] == args.num_steps_wait
+                        and metadata["episode_seed"] == args.seed + 1000 * metadata["task_id"] + episode_index
+                    )
+                except (OSError, ValueError, KeyError, TypeError):
+                    stage_complete = False
+            if artifacts.rollout_video.exists() and attention_complete and stage_complete:
                 return ExistingEpisodeResult(success=success, video_path=artifacts.rollout_video)
         return None
 
@@ -522,8 +557,12 @@ class EpisodeFrameCollector:
         task_description: str,
         episode_index: int,
         dump_interval: int,
+        include_terminal: bool = False,
     ) -> pathlib.Path:
         frame_indices = list(range(0, len(self.replay_images), dump_interval))
+        if include_terminal:
+            frame_indices = sorted(set(frame_indices + [len(self.replay_images) - 1]))
+            artifacts._write_video(artifacts.wrist_video, self.wrist_images, fps=10)
         artifacts.write_rollout(self.replay_images, fps=10)
         artifacts.write_images(self.replay_images, self.wrist_images, frame_indices)
         artifacts.write_attention(
@@ -574,6 +613,9 @@ class EpisodeRunner:
         initial_states,
         model_prompt: str,
         max_steps: int,
+        suite_name: Optional[str] = None,
+        task_name: Optional[str] = None,
+        task_bddl_file: Optional[str] = None,
     ):
         self.args = args
         self.client = client
@@ -583,6 +625,9 @@ class EpisodeRunner:
         self.initial_states = initial_states
         self.model_prompt = model_prompt
         self.max_steps = max_steps
+        self.suite_name = suite_name or args.task_suite_name
+        self.task_name = task_name
+        self.task_bddl_file = task_bddl_file
 
     def _episode_seed(self, episode_idx: int) -> int:
         return int(self.args.seed + 1000 * int(self.task_id) + int(episode_idx))
@@ -597,6 +642,7 @@ class EpisodeRunner:
 
         rng = np.random.RandomState(episode_seed)
         init_idx = int(rng.randint(len(self.initial_states)))
+        self.init_state_index = init_idx
         return self.env.set_init_state(self.initial_states[init_idx])
 
     def _infer_actions(self, obs: Dict[str, Any], img: np.ndarray, wrist_img: np.ndarray) -> Dict[str, Any]:
@@ -607,67 +653,101 @@ class EpisodeRunner:
         obs = self._reset_episode(episode_idx)
         action_plan = collections.deque()
         frame_collector = EpisodeFrameCollector()
-        done = False
-        last_error = None
-        t = 0
+        done, last_error = False, None
+        t, executed = 0, 0
         current_attention = None
         attention_source_env_step = None
+        policy_call_id, chunk_index = -1, 0
+        recorder = None
+        termination_reason = "timeout"
 
-        while t < self.max_steps + self.args.num_steps_wait:
+        # Preserve the original warm-up before the first policy observation.
+        for _ in range(self.args.num_steps_wait):
+            obs, _, done, _ = self.env.step(LIBERO_DUMMY_ACTION)
+            t += 1
+
+        if self.args.export_stage_data:
+            recorder = StageRecorder(self.env, {
+                "suite": self.suite_name, "task_id": self.task_id, "task_name": self.task_name,
+                "task_bddl_reference": self.task_bddl_file,
+                "instruction": self.task_description, "prompt_sent": self.model_prompt,
+                "category": self.args.category, "episode_index": episode_idx,
+                "episode_seed": self._episode_seed(episode_idx), "init_state_index": self.init_state_index,
+                "initial_state_sha256": hashlib.sha256(
+                    np.asarray(self.initial_states[self.init_state_index]).tobytes()).hexdigest(),
+                "num_steps_wait": self.args.num_steps_wait, "replan_steps": self.args.replan_steps,
+                "repository_revision": revision(REPO_ROOT),
+                "libero_plus_revision": revision(REPO_ROOT / "third_party" / "LIBERO-plus"),
+                "image_transform": {"flip_axes": [0, 1], "resize_with_pad": self.args.resize_size,
+                                    "source_shape": list(obs["agentview_image"].shape)},
+                "action_semantics": "post-policy-transform action exactly passed to env.step; see action_spec and controller_config",
+            }, self.args.stage_plan_path)
+
+        def append_observation():
+            img, wrist = PolicyIO.prepare_images(obs, self.args.resize_size)
+            # StageRecorder can fail without adding a mismatched video frame.
+            recorder.capture(obs, t)
+            frame_collector.append_step(img, wrist, attention=None, env_step=t, source_env_step=t)
+
+        if recorder is not None:
+            append_observation()
+
+        while executed < self.max_steps:
             try:
-                if t < self.args.num_steps_wait:
-                    obs, _, done, _ = self.env.step(LIBERO_DUMMY_ACTION)
-                    t += 1
-                    continue
-
-                img, wrist_img = PolicyIO.prepare_images(obs, self.args.resize_size)
-
+                if recorder is not None:
+                    img, wrist_img = frame_collector.replay_images[-1], frame_collector.wrist_images[-1]
+                else:
+                    img, wrist_img = PolicyIO.prepare_images(obs, self.args.resize_size)
                 if not action_plan:
-                    if t == self.args.num_steps_wait:
-                        logging.info(f"[DEBUG] Sending prompt to model: '{self.model_prompt}'")
-
                     response = self._infer_actions(obs, img, wrist_img)
+                    planned = _planned_actions(response, self.args.replan_steps)
                     current_attention = response.get("attention")
                     attention_source_env_step = t
-                    action_plan.extend(_planned_actions(response, self.args.replan_steps))
-
+                    action_plan.extend(planned)
+                    policy_call_id = recorder.record_policy_call(response, self.args.replan_steps) if recorder else policy_call_id + 1
+                    chunk_index = 0
                 action = action_plan.popleft()
-                frame_collector.append_step(
-                    img,
-                    wrist_img,
-                    attention=current_attention,
-                    env_step=t,
-                    source_env_step=t if attention_source_env_step is None else attention_source_env_step,
-                )
+                if recorder is not None:
+                    frame_collector.attention_per_frame[-1] = None if current_attention is None else {
+                        "attention": current_attention, "env_step": t,
+                        "source_env_step": attention_source_env_step,
+                        "attention_reused": t != attention_source_env_step,
+                    }
+                else:
+                    frame_collector.append_step(img, wrist_img, attention=current_attention, env_step=t,
+                                                source_env_step=attention_source_env_step)
                 obs, _, done, _ = self.env.step(action.tolist())
-                if done:
-                    break
+                executed += 1
                 t += 1
-
+                if recorder is not None:
+                    recorder.record_action(action, policy_call_id, chunk_index, done)
+                    append_observation()
+                chunk_index += 1
+                if done:
+                    termination_reason = "success"
+                    break
             except Exception as e:
                 last_error = f"{type(e).__name__}: {e}"
-                logging.error(f"Caught exception: {e}")
+                termination_reason = "error"
+                logging.exception("Episode failed")
                 break
 
-        artifacts = EpisodeArtifacts.from_result(
-            self.args,
-            self.task_description,
-            episode_idx,
-            success=done,
-        )
+        artifacts = EpisodeArtifacts.from_result(self.args, self.task_description, episode_idx, success=done)
+        # Invalidate a previous completion marker before rewriting any artifacts.
+        if recorder is not None:
+            (artifacts.stage_dir / "manifest.json").unlink(missing_ok=True)
         video_path = frame_collector.write_artifacts(
-            artifacts,
-            task_description=self.task_description,
-            episode_index=episode_idx,
-            dump_interval=self.args.attention_dump_interval,
+            artifacts, task_description=self.task_description, episode_index=episode_idx,
+            dump_interval=self.args.attention_dump_interval, include_terminal=recorder is not None,
         )
+        if recorder is not None:
+            recorder.write(artifacts.stage_dir, success=bool(done), termination_reason=termination_reason,
+                           error=last_error, image_interval=self.args.attention_dump_interval,
+                           video_paths={"agentview": str(video_path.resolve()),
+                                        "wristview": str(artifacts.wrist_video.resolve())})
         return EpisodeRunResult(
-            success=bool(done),
-            steps_taken=t,
-            video_path=video_path,
-            image_dir=artifacts.image_dir,
-            attention_path=artifacts.attention_dir,
-            last_error=last_error,
+            success=bool(done), steps_taken=t, video_path=video_path,
+            image_dir=artifacts.image_dir, attention_path=artifacts.attention_dir, last_error=last_error,
         )
 
 
@@ -793,6 +873,8 @@ class ResultsStore:
                 "resize_size": self.args.resize_size,
                 "replan_steps": self.args.replan_steps,
                 "attention_dump_interval": self.args.attention_dump_interval,
+                "export_stage_data": self.args.export_stage_data,
+                "stage_plan_path": self.args.stage_plan_path,
                 "num_trials_per_task": self.args.num_trials_per_task,
                 "num_rollouts": self.args.num_rollouts,
                 "seed": self.args.seed,
@@ -826,13 +908,17 @@ class ResultsStore:
         data = self._read_json()
 
         bucket = "success" if success else "failure"
-        for existing_record in data.get(bucket, []):
-            if (
-                existing_record.get("task_id") == task_id
-                and existing_record.get("episode_index") == episode_index
-                and existing_record.get("task_description") == task_description
-            ):
+        # A rerun may replace a legacy rollout or change success status.
+        def matches(existing_record):
+            return (existing_record.get("task_id") == task_id
+                    and existing_record.get("episode_index") == episode_index
+                    and existing_record.get("task_description") == task_description
+                    and existing_record.get("extra", {}).get("suite") in (None, (extra or {}).get("suite")))
+        if (extra or {}).get("skipped"):
+            if any(matches(r) for r in data.get(bucket, [])):
                 return
+        for old_bucket in ("success", "failure"):
+            data[old_bucket] = [r for r in data.get(old_bucket, []) if not matches(r)]
 
         record: Dict[str, Any] = {
             "timestamp": dt.datetime.now(dt.timezone.utc).isoformat(),
@@ -853,12 +939,9 @@ class ResultsStore:
             "running_counts",
             {"total_episodes": 0, "total_successes": 0, "success_rate": 0.0},
         )
-        rc["total_episodes"] = int(rc.get("total_episodes", 0)) + 1
-        if success:
-            rc["total_successes"] = int(rc.get("total_successes", 0)) + 1
-        total = max(1, rc["total_episodes"])
-        rc["success_rate"] = float(rc["total_successes"]) / float(total)
-
+        rc["total_episodes"] = len(data["success"]) + len(data["failure"])
+        rc["total_successes"] = len(data["success"])
+        rc["success_rate"] = float(rc["total_successes"]) / max(1, rc["total_episodes"])
         data.setdefault("meta", {})
         data["meta"]["updated_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
         self._atomic_write_json(data, self.path)
@@ -867,6 +950,15 @@ class ResultsStore:
 def _prepare_output_dirs(args: Args) -> None:
     if args.attention_dump_interval <= 0:
         raise ValueError("attention_dump_interval must be positive")
+    if args.replan_steps <= 0 or args.num_steps_wait < 0:
+        raise ValueError("replan_steps must be positive and num_steps_wait non-negative")
+    if args.stage_plan_path:
+        with open(args.stage_plan_path, encoding="utf-8") as f:
+            plan = json.load(f)
+        if not isinstance(plan.get("tasks"), list):
+            raise ValueError("stage_plan_path must contain a tasks list")
+        if plan.get("task_count") != len(plan["tasks"]):
+            logging.warning("Stage plan task_count differs from actual tasks length; saving original plan unchanged")
     pathlib.Path(args.video_out_path).mkdir(parents=True, exist_ok=True)
     pathlib.Path(args.image_out_path).mkdir(parents=True, exist_ok=True)
     pathlib.Path(args.attention_out_path).mkdir(parents=True, exist_ok=True)
@@ -972,6 +1064,8 @@ def eval_libero(args: Args) -> None:
                     initial_states=initial_states,
                     model_prompt=model_prompt,
                     max_steps=max_steps,
+                    suite_name=suite_name, task_name=task.name,
+                    task_bddl_file=str(pathlib.Path(task.problem_folder) / task.bddl_file),
                 )
 
                 for episode_idx in tqdm.tqdm(range(args.num_trials_per_task), desc=f"episodes for task {task_id}"):
@@ -1019,6 +1113,7 @@ def eval_libero(args: Args) -> None:
                             **_episode_extra(args, suite_name, max_steps, model_prompt),
                             "image_dir": str(result.image_dir),
                             "attention_path": str(result.attention_path),
+                            "annotation_dir": str(result.image_dir / "annotation") if args.export_stage_data else None,
                         },
                     )
             finally:

@@ -51,6 +51,9 @@ class Args:
     client_host: str = "127.0.0.1"
     resize_size: int = 224
     replan_steps: int = 5
+    attention_dump_interval: int = 1
+    export_stage_data: bool = True
+    stage_plan_path: Optional[str] = None
 
     client_use_xvfb: bool = False
     client_mujoco_gl: Optional[str] = None
@@ -657,6 +660,12 @@ def _build_client_cmd(args: Args, task: dict, port: int) -> tuple[list[str], pat
             task["suite"],
             "--args.video_out_path",
             str(video_path),
+            "--image-out-path",
+            str(pathlib.Path(args.results_base_dir) / task_slug / "rollout_images"),
+            "--attention-out-path",
+            str(pathlib.Path(args.results_base_dir) / task_slug / "rollout_attention"),
+            "--attention-dump-interval",
+            str(args.attention_dump_interval),
             "--args.results-json-path",
             str(result_json),
             "--args.port",
@@ -670,6 +679,10 @@ def _build_client_cmd(args: Args, task: dict, port: int) -> tuple[list[str], pat
         ]
     )
 
+    if not args.export_stage_data:
+        cmd.append("--no-export-stage-data")
+    if args.stage_plan_path:
+        cmd.extend(["--stage-plan-path", str(pathlib.Path(args.stage_plan_path).resolve())])
     if task["category"] is not None:
         cmd.extend(["--args.category", task["category"]])
     if args.task_ids:
