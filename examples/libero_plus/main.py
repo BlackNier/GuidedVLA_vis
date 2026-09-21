@@ -20,6 +20,8 @@ from openpi_client import websocket_client_policy as _websocket_client_policy
 import tqdm
 import tyro
 
+from stage_state_export import StageStateRecorder
+
 LIBERO_DUMMY_ACTION = [0.0] * 6 + [-1.0]
 ATTENTION_CAPTURE_IMPL = "fp32_masked_softmax_v2"
 LIBERO_ENV_RESOLUTION = 256  # resolution used to render training data
@@ -70,6 +72,11 @@ class Args:
     # Save one image/PT pair every N exported rollout frames.  This is the
     # client-side counterpart of the server-side attention dump interval.
     attention_dump_interval: int = 1
+
+    # Export frame-aligned minimal simulation evidence beside the images.
+    export_stage_state: bool = False
+    image_dump_interval: Optional[int] = None
+    save_attention: bool = True
 
     seed: int = 7
 
@@ -386,7 +393,7 @@ class EpisodeArtifacts:
             if "weights_only" not in str(exc):
                 return False
             payload = torch.load(attention_files[0], map_location="cpu")
-        return payload.get("attention", {}).get("capture_impl") == ATTENTION_CAPTURE_IMPL
+        return (payload.get("attention") or {}).get("capture_impl") == ATTENTION_CAPTURE_IMPL
 
     @classmethod
     def find_existing(
@@ -407,8 +414,20 @@ class EpisodeArtifacts:
                 image_complete
                 and agentview_frames == attention_frames
                 and cls._attention_capture_is_current(artifacts.attention_dir)
-            )
-            if artifacts.rollout_video.exists() and attention_complete:
+            ) if args.save_attention else image_complete
+            state_complete = True
+            if args.export_stage_state:
+                manifest = artifacts.image_dir / "stage_state" / "manifest.json"
+                try:
+                    state_meta = json.loads(manifest.read_text())
+                    state_complete = (
+                        state_meta.get("complete") is True
+                        and {f"{i:06d}" for i in state_meta["image_frames"]} == agentview_frames
+                        and (manifest.parent / "states.jsonl").is_file()
+                    )
+                except (OSError, ValueError, KeyError):
+                    state_complete = False
+            if artifacts.rollout_video.exists() and attention_complete and state_complete:
                 return ExistingEpisodeResult(success=success, video_path=artifacts.rollout_video)
         return None
 
@@ -522,16 +541,18 @@ class EpisodeFrameCollector:
         task_description: str,
         episode_index: int,
         dump_interval: int,
+        save_attention: bool = True,
     ) -> pathlib.Path:
         frame_indices = list(range(0, len(self.replay_images), dump_interval))
         artifacts.write_rollout(self.replay_images, fps=10)
         artifacts.write_images(self.replay_images, self.wrist_images, frame_indices)
-        artifacts.write_attention(
-            self.attention_per_frame,
-            frame_indices=frame_indices,
-            task_description=task_description,
-            episode_index=episode_index,
-        )
+        if save_attention:
+            artifacts.write_attention(
+                self.attention_per_frame,
+                frame_indices=frame_indices,
+                task_description=task_description,
+                episode_index=episode_index,
+            )
         return artifacts.rollout_video
 
 
@@ -605,6 +626,7 @@ class EpisodeRunner:
 
     def run(self, episode_idx: int) -> EpisodeRunResult:
         obs = self._reset_episode(episode_idx)
+        recorder = StageStateRecorder(self.env, self.model_prompt, self.task_id, episode_idx) if self.args.export_stage_state else None
         action_plan = collections.deque()
         frame_collector = EpisodeFrameCollector()
         done = False
@@ -631,6 +653,8 @@ class EpisodeRunner:
                     attention_source_env_step = t
                     action_plan.extend(_planned_actions(response, self.args.replan_steps))
 
+                if recorder is not None:
+                    recorder.capture(obs, len(frame_collector.replay_images), t)
                 action = action_plan.popleft()
                 frame_collector.append_step(
                     img,
@@ -649,6 +673,9 @@ class EpisodeRunner:
                 logging.error(f"Caught exception: {e}")
                 break
 
+        if recorder is not None and last_error is None:
+            recorder.capture(obs, len(frame_collector.replay_images),
+                             self.args.num_steps_wait + len(frame_collector.replay_images), has_image=False)
         artifacts = EpisodeArtifacts.from_result(
             self.args,
             self.task_description,
@@ -659,8 +686,13 @@ class EpisodeRunner:
             artifacts,
             task_description=self.task_description,
             episode_index=episode_idx,
-            dump_interval=self.args.attention_dump_interval,
+            dump_interval=self.args.image_dump_interval or self.args.attention_dump_interval,
+            save_attention=self.args.save_attention,
         )
+        if recorder is not None:
+            recorder.write(artifacts.image_dir,
+                           range(0, len(frame_collector.replay_images), self.args.image_dump_interval or self.args.attention_dump_interval),
+                           error=last_error)
         return EpisodeRunResult(
             success=bool(done),
             steps_taken=t,
@@ -865,6 +897,8 @@ class ResultsStore:
 
 
 def _prepare_output_dirs(args: Args) -> None:
+    if args.image_dump_interval is not None and args.image_dump_interval <= 0:
+        raise ValueError("image_dump_interval must be positive")
     if args.attention_dump_interval <= 0:
         raise ValueError("attention_dump_interval must be positive")
     pathlib.Path(args.video_out_path).mkdir(parents=True, exist_ok=True)
