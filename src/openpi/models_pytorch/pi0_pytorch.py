@@ -487,14 +487,21 @@ class PI0Pytorch(nn.Module):
 
         for _, states in all_supervised_states:
             cached_attention_probs = self.get_object_attention_probs(states)
-            total_loss = total_loss + self.compute_object_mass_loss(
-                cached_attention_probs,
-                action_query_start_index,
-                object_head_indices,
-                object_targets["object_maps"],
-                object_targets["object_masks"],
-                head_aggregation=head_aggregation,
-            )
+            if "per_object_maps" in object_targets:
+                from openpi.models_pytorch.weighted_object_loss import weighted_object_mass_loss
+
+                layer_loss = weighted_object_mass_loss(
+                    cached_attention_probs, action_query_start_index, object_head_indices,
+                    object_targets["per_object_maps"], object_targets["per_object_weights"],
+                    object_targets["per_object_valid"], head_aggregation,
+                )
+            else:
+                layer_loss = self.compute_object_mass_loss(
+                    cached_attention_probs, action_query_start_index, object_head_indices,
+                    object_targets["object_maps"], object_targets["object_masks"],
+                    head_aggregation=head_aggregation,
+                )
+            total_loss = total_loss + layer_loss
             num_layers += 1
 
         if num_layers == 0:

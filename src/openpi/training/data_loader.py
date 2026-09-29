@@ -946,7 +946,14 @@ class DataLoaderImpl(DataLoader):
         for batch in self._data_loader:
             object_targets = {}
 
-            if self._use_object_loss:
+            if self._use_object_loss and "weighted_objects" in batch:
+                from openpi.shared.weighted_object_targets import pack_targets
+
+                object_targets = pack_targets(batch["weighted_objects"], self._allowed_object_views_set)
+                if not self._logged_object_map_keys:
+                    logging.info("Object loss mode: per_object_weighted_log_mass (union fallback disabled)")
+                    self._logged_object_map_keys = True
+            elif self._use_object_loss:
                 obj_maps_dict = self._extract_object_maps(batch)
                 if not obj_maps_dict:
                     expected_keys = sorted(_attention_map.DATASET_OBJECT_MAP_KEY_TO_VIEW)

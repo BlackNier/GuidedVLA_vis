@@ -407,8 +407,11 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
                         "prompt": "prompt",
                         "skill_id": "observation.skill_id",
                         "attention_map": {key: key for key in _attention_map.LIBERO_OBJECT_MAP_KEY_TO_VIEW},
+                        "weighted_objects": {f"{v}_object_{s}": f"{v}_object_{s}"
+                                             for v in ("agentview", "wrist")
+                                             for s in ("masks", "weights", "valid")},
                     },
-                    optional_keys=frozenset(["attention_map", "skill_id"]),
+                    optional_keys=frozenset(["attention_map", "skill_id", "weighted_objects"]),
                 )
             ]
         )
@@ -823,7 +826,7 @@ _CONFIGS = [
             base_config=DataConfig(
                 prompt_from_task=True,
                 use_object_loss=True,
-                local_root_dir="/home/kslab/zijian/work/GuidedVLA/data/datasets/ybwowen_libero/"
+                local_root_dir="/home/kslab/zijian/work/GuidedVLA/data/datasets/libero_sam2_weighted/"
             ),
             extra_delta_transform=True,
         ),

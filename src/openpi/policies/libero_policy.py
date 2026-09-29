@@ -97,6 +97,9 @@ class LiberoInputs(transforms.DataTransformFn):
         if "skill_text" in data:
             inputs["skill_text"] = data["skill_text"]
 
+        if "weighted_objects" in data:
+            inputs["weighted_objects"] = {k: np.asarray(v) for k, v in data["weighted_objects"].items()}
+
         return inputs
 
 

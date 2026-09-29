@@ -295,6 +295,15 @@ def prepare_object_targets(
                 dtype=target_dtype,
                 non_blocking=True,
             )
+    group_keys = ("per_object_maps", "per_object_weights", "per_object_valid")
+    if any(k in object_target_batch for k in group_keys):
+        if not all(k in object_target_batch for k in group_keys):
+            raise RuntimeError("Incomplete per-object supervision tensors")
+        for key in group_keys:
+            object_targets[key] = object_target_batch[key].to(
+                device=device, dtype=torch.bool if key == "per_object_valid" else torch.float32,
+                non_blocking=True,
+            )
     return object_targets
 
 
