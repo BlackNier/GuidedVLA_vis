@@ -201,15 +201,21 @@ class DataConfigFactory(abc.ABC):
             self.base_config or DataConfig(),
             repo_id=repo_id,
             asset_id=asset_id,
-            norm_stats=self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), asset_id),
+            norm_stats=self._load_norm_stats(self.assets.assets_dir or assets_dirs, asset_id),
             use_quantile_norm=model_config.model_type != ModelType.PI0,
         )
 
-    def _load_norm_stats(self, assets_dir: epath.Path, asset_id: str | None) -> dict[str, _transforms.NormStats] | None:
+    def _load_norm_stats(
+        self, assets_dir: str | pathlib.Path | epath.Path, asset_id: str | None
+    ) -> dict[str, _transforms.NormStats] | None:
         if asset_id is None:
             return None
         try:
-            data_assets_dir = str(assets_dir / asset_id)
+            # epath treats /gs/<name> as gs://<name>, including local HPC mounts.
+            # Only explicitly spelled remote URIs should use its cloud handling.
+            assets_path = str(assets_dir)
+            base = epath.Path(assets_path) if "://" in assets_path else pathlib.Path(assets_path).expanduser()
+            data_assets_dir = str(base / asset_id)
             norm_stats = _normalize.load(_download.maybe_download(data_assets_dir))
             logging.info(f"Loaded norm stats from {data_assets_dir}")
             return norm_stats
