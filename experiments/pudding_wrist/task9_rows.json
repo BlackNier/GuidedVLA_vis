@@ -1,0 +1,142 @@
+[
+  {
+    "episode": 24,
+    "file": "data/chunk-000/file-008.parquet"
+  },
+  {
+    "episode": 31,
+    "file": "data/chunk-000/file-010.parquet"
+  },
+  {
+    "episode": 60,
+    "file": "data/chunk-000/file-020.parquet"
+  },
+  {
+    "episode": 70,
+    "file": "data/chunk-000/file-024.parquet"
+  },
+  {
+    "episode": 76,
+    "file": "data/chunk-000/file-026.parquet"
+  },
+  {
+    "episode": 78,
+    "file": "data/chunk-000/file-027.parquet"
+  },
+  {
+    "episode": 83,
+    "file": "data/chunk-000/file-028.parquet"
+  },
+  {
+    "episode": 94,
+    "file": "data/chunk-000/file-032.parquet"
+  },
+  {
+    "episode": 115,
+    "file": "data/chunk-000/file-040.parquet"
+  },
+  {
+    "episode": 117,
+    "file": "data/chunk-000/file-041.parquet"
+  },
+  {
+    "episode": 118,
+    "file": "data/chunk-000/file-041.parquet"
+  },
+  {
+    "episode": 123,
+    "file": "data/chunk-000/file-043.parquet"
+  },
+  {
+    "episode": 130,
+    "file": "data/chunk-000/file-045.parquet"
+  },
+  {
+    "episode": 137,
+    "file": "data/chunk-000/file-048.parquet"
+  },
+  {
+    "episode": 157,
+    "file": "data/chunk-000/file-054.parquet"
+  },
+  {
+    "episode": 158,
+    "file": "data/chunk-000/file-055.parquet"
+  },
+  {
+    "episode": 178,
+    "file": "data/chunk-000/file-062.parquet"
+  },
+  {
+    "episode": 184,
+    "file": "data/chunk-000/file-064.parquet"
+  },
+  {
+    "episode": 201,
+    "file": "data/chunk-000/file-070.parquet"
+  },
+  {
+    "episode": 221,
+    "file": "data/chunk-000/file-076.parquet"
+  },
+  {
+    "episode": 231,
+    "file": "data/chunk-000/file-080.parquet"
+  },
+  {
+    "episode": 253,
+    "file": "data/chunk-000/file-086.parquet"
+  },
+  {
+    "episode": 255,
+    "file": "data/chunk-000/file-087.parquet"
+  },
+  {
+    "episode": 259,
+    "file": "data/chunk-000/file-088.parquet"
+  },
+  {
+    "episode": 273,
+    "file": "data/chunk-000/file-093.parquet"
+  },
+  {
+    "episode": 291,
+    "file": "data/chunk-000/file-100.parquet"
+  },
+  {
+    "episode": 302,
+    "file": "data/chunk-000/file-103.parquet"
+  },
+  {
+    "episode": 323,
+    "file": "data/chunk-000/file-110.parquet"
+  },
+  {
+    "episode": 324,
+    "file": "data/chunk-000/file-110.parquet"
+  },
+  {
+    "episode": 344,
+    "file": "data/chunk-000/file-117.parquet"
+  },
+  {
+    "episode": 351,
+    "file": "data/chunk-000/file-120.parquet"
+  },
+  {
+    "episode": 363,
+    "file": "data/chunk-000/file-124.parquet"
+  },
+  {
+    "episode": 370,
+    "file": "data/chunk-000/file-126.parquet"
+  },
+  {
+    "episode": 378,
+    "file": "data/chunk-000/file-129.parquet"
+  },
+  {
+    "episode": 379,
+    "file": "data/chunk-000/file-129.parquet"
+  }
+]
