@@ -1,0 +1,106 @@
+{
+  "multi": {
+    "config": {
+      "model": {
+        "action_dim": 32,
+        "action_horizon": 50,
+        "max_token_len": 48,
+        "dtype": "float32",
+        "paligemma_variant": "gemma_2b",
+        "action_expert_variant": "gemma_300m",
+        "pi05": false,
+        "discrete_state_input": false,
+        "guided_layer_indices": [
+          9,
+          10,
+          11,
+          12
+        ],
+        "control_attention_enabled": true,
+        "control_attention_num_heads": 8,
+        "control_attention_copy_weights": false,
+        "control_attention_freeze_origin": false,
+        "control_attention_distill_only": false,
+        "control_attention_use_headwise_gate": null,
+        "use_object_loss": true,
+        "object_supervision_views": [
+          "base_0",
+          "left_wrist_0",
+          "right_wrist_0"
+        ],
+        "object_head_indices": [
+          0,
+          1
+        ],
+        "object_use_control": true,
+        "object_loss_head_aggregation": "mean_heads",
+        "use_depth": false,
+        "depth_model_name": null,
+        "depth_head_indices": [
+          4
+        ],
+        "depth_use_control": false,
+        "use_skill_loss": false,
+        "skill_num_classes": 8,
+        "skill_head_indices": [
+          2,
+          3
+        ],
+        "skill_use_control": false,
+        "skill_infer_time": 0.001
+      }
+    }
+  },
+  "single": {
+    "config": {
+      "model": {
+        "action_dim": 32,
+        "action_horizon": 50,
+        "max_token_len": 48,
+        "dtype": "float32",
+        "paligemma_variant": "gemma_2b",
+        "action_expert_variant": "gemma_300m",
+        "pi05": false,
+        "discrete_state_input": false,
+        "guided_layer_indices": [
+          9,
+          10,
+          11,
+          12
+        ],
+        "control_attention_enabled": true,
+        "control_attention_num_heads": 8,
+        "control_attention_copy_weights": false,
+        "control_attention_freeze_origin": false,
+        "control_attention_distill_only": false,
+        "control_attention_use_headwise_gate": null,
+        "use_object_loss": true,
+        "object_supervision_views": [
+          "base_0",
+          "left_wrist_0",
+          "right_wrist_0"
+        ],
+        "object_head_indices": [
+          0,
+          1
+        ],
+        "object_use_control": true,
+        "object_loss_head_aggregation": "mean_heads",
+        "use_depth": false,
+        "depth_model_name": null,
+        "depth_head_indices": [
+          4
+        ],
+        "depth_use_control": false,
+        "use_skill_loss": false,
+        "skill_num_classes": 8,
+        "skill_head_indices": [
+          2,
+          3
+        ],
+        "skill_use_control": false,
+        "skill_infer_time": 0.001
+      }
+    }
+  }
+}
